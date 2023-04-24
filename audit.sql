@@ -1,23 +1,24 @@
 /** Get array of table's primary key columns
 **/
-CREATE OR REPLACE FUNCTION f_table_pk_columns( table_schema TEXT, table_name TEXT ) RETURNS TEXT[] AS $$
+CREATE OR REPLACE FUNCTION "${schema}".f_table_pk_columns(table_schema TEXT, table_name TEXT) RETURNS TEXT[] AS $$
     SELECT
-        array_agg( a.attname::TEXT )
+        array_agg(a.attname::TEXT)
     FROM
         pg_index AS i
     JOIN
-        pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = ANY( i.indkey )
+        pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
     WHERE
-        i.indrelid = ( (CASE WHEN table_schema IS NULL THEN '' ELSE QUOTE_IDENT( table_schema ) || '.' END) || QUOTE_IDENT( table_name ) )::regclass
+        i.indrelid = ((CASE WHEN table_schema IS NULL THEN '' ELSE QUOTE_IDENT(table_schema) || '.' END) || QUOTE_IDENT(table_name))::regclass
         AND
         i.indisprimary
     ;
 $$ LANGUAGE SQL /*depends on arguments only*/IMMUTABLE;
 
+
 /** This function returns iterable set of table columns excluding
     user-specified non-auditable columns
 **/
-CREATE OR REPLACE FUNCTION f_audit_columns( schema_name TEXT, name TEXT, skip_columns TEXT[] ) RETURNS SETOF TEXT AS $$
+CREATE OR REPLACE FUNCTION "${schema}".f_audit_columns(schema_name TEXT, name TEXT, skip_columns TEXT[]) RETURNS SETOF TEXT AS $$
 DECLARE
     r RECORD;
 BEGIN
@@ -26,7 +27,7 @@ BEGIN
         FROM information_schema.columns AS c
         WHERE   c.table_schema = schema_name
             AND c.table_name   = name
-            AND NOT( c.column_name::TEXT = ANY( skip_columns ) )
+            AND NOT(c.column_name::TEXT = ANY(skip_columns))
     LOOP
         RETURN NEXT r.column_name;
     END LOOP;
@@ -34,21 +35,23 @@ BEGIN
 END
 $$ IMMUTABLE ROWS 200 LANGUAGE plpgsql;
 
+
 /** Audit log table.
     Stores changes in tables with audit log trigger attached.
 **/
-CREATE TABLE t_audit_log (
-     date_time      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE "${schema}".t_audit_log (
+     date_time      TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
     ,transaction_id BIGINT NOT NULL DEFAULT txid_current() -- allows grouping changes by transaction
     ,client_ip      INET DEFAULT inet_client_addr()
+    ,identity_id    TEXT DEFAULT NULLIF(CURRENT_SETTING('${schema}.current_identity_id', true), '')
     ,operation      TEXT NOT NULL
     ,table_schema   TEXT NOT NULL
     ,table_name     TEXT NOT NULL
-    ,record_id      TEXT NOT NULL
-    ,column_name    TEXT NOT NULL
-    ,old_value      TEXT
-    ,new_value      TEXT
+    ,record_id      JSONB NOT NULL
+    ,old_values     JSONB
+    ,new_values     JSONB
 );
+
 
 /** Trigger function which creates audit log records on table row updates.
     @param record ID columns    {ARRAY} optional; if empty, uses f_table_pk_columns() to get primary key columns.
@@ -71,17 +74,17 @@ CREATE TABLE t_audit_log (
         CREATE TRIGGER zz_audit AFTER INSERT OR UPDATE OR DELETE ON <table>
             FOR EACH ROW EXECUTE PROCEDURE f_audit('{"user_id", "account_id", "company_id"}');
 **/
-CREATE OR REPLACE FUNCTION f_audit() RETURNS TRIGGER AS $F$
+CREATE OR REPLACE FUNCTION "${schema}".f_audit() RETURNS TRIGGER AS $$
 DECLARE
     rec          RECORD;
-    rec_id       TEXT;
+    rec_id       JSONB;
     skip_columns TEXT[];
     key_columns  TEXT[];
     key_size     INT;
+    key_values   TEXT[];
     key_val      TEXT;
-    col_name     TEXT;
-    old_val      TEXT;
-    new_val      TEXT;
+    old_object   JSONB;
+    new_object   JSONB;
     i            INT;
 BEGIN
     IF TG_OP = 'DELETE' THEN
@@ -90,103 +93,96 @@ BEGIN
         rec := NEW;
     END IF;
 
-    rec_id := '';
-
     key_columns := CASE
-        WHEN TG_NARGS < 1 OR TG_ARGV[0] IS NULL THEN f_table_pk_columns( TG_TABLE_SCHEMA, TG_TABLE_NAME )
+        WHEN TG_NARGS < 1 OR TG_ARGV[0] IS NULL THEN "${schema}".f_table_pk_columns(TG_TABLE_SCHEMA, TG_TABLE_NAME)
         ELSE TG_ARGV[0]::TEXT[]
     END;
-    key_size := ARRAY_LENGTH( key_columns, 1 );
+    key_size := ARRAY_LENGTH(key_columns, 1);
 
     FOR i IN 1 .. key_size LOOP
-        EXECUTE format('SELECT CAST( $1.%I AS TEXT )', key_columns[i] ) INTO key_val USING rec;
-        IF key_val IS NULL THEN
-            key_val := '#';
-        ELSE
-            /* escape special characters */
-            key_val := regexp_replace( key_val, '([~|#])', E'~\\1', 'g' );
-        END IF;
-
-        IF i = 1 THEN
-            rec_id := key_val;
-        ELSE
-            rec_id := rec_id || '|' || key_val;
-        END IF;
+        EXECUTE format('SELECT CAST($1.%I AS TEXT)', key_columns[i]) INTO key_val USING rec;
+        key_values := array_append(key_values, key_val);
     END LOOP;
 
-    skip_columns := ARRAY_CAT( key_columns, TG_ARGV[ 1:( TG_NARGS - 1 ) ] );
+    rec_id := JSONB_OBJECT(key_columns, key_values);
+
+    skip_columns := ARRAY_CAT(key_columns, TG_ARGV[1:(TG_NARGS - 1)]);
 
     IF TG_OP = 'UPDATE' THEN
-        FOR col_name IN SELECT * FROM f_audit_columns( TG_TABLE_SCHEMA, TG_TABLE_NAME, skip_columns ) LOOP
-            EXECUTE format('SELECT CAST( $1.%I AS TEXT ), CAST( $2.%I AS TEXT )', col_name, col_name )
-                INTO old_val, new_val USING OLD, NEW;
-
-            IF old_val IS DISTINCT FROM new_val THEN
-                INSERT INTO t_audit_log (
-                     operation
-                    ,table_schema
-                    ,table_name
-                    ,record_id
-                    ,column_name
-                    ,old_value
-                    ,new_value
-                ) VALUES (
-                     TG_OP
-                    ,TG_TABLE_SCHEMA
-                    ,TG_TABLE_NAME
-                    ,rec_id
-                    ,col_name
-                    ,old_val
-                    ,new_val
-                );
-            END IF;
-        END LOOP;
+        SELECT
+             jsonb_object_agg(COALESCE(old_values.key, new_values.key), old_values.value)
+            ,jsonb_object_agg(COALESCE(old_values.key, new_values.key), new_values.value)
+        INTO
+             old_object
+            ,new_object
+        FROM
+            jsonb_each(TO_JSONB(OLD) - skip_columns) AS old_values
+            FULL OUTER JOIN jsonb_each(TO_JSONB(NEW) - skip_columns) AS new_values ON new_values.key = old_values.key
+        WHERE
+            new_values.value IS DISTINCT FROM old_values.value
+        ;
     ELSIF TG_OP = 'INSERT' THEN
-        FOR col_name IN SELECT * FROM f_audit_columns( TG_TABLE_SCHEMA, TG_TABLE_NAME, skip_columns ) LOOP
-            EXECUTE format('SELECT CAST( $1.%I AS TEXT )', col_name ) INTO new_val USING NEW;
-
-            IF new_val IS NOT NULL THEN
-                INSERT INTO t_audit_log (
-                     operation
-                    ,table_schema
-                    ,table_name
-                    ,record_id
-                    ,column_name
-                    ,new_value
-                ) VALUES (
-                     TG_OP
-                    ,TG_TABLE_SCHEMA
-                    ,TG_TABLE_NAME
-                    ,rec_id
-                    ,col_name
-                    ,new_val
-                );
-            END IF;
-        END LOOP;
+        old_object := NULL;
+        new_object := TO_JSONB(NEW) - skip_columns;
     ELSIF TG_OP = 'DELETE' THEN
-        FOR col_name IN SELECT * FROM f_audit_columns( TG_TABLE_SCHEMA, TG_TABLE_NAME, skip_columns ) LOOP
-            EXECUTE format('SELECT CAST( $1.%I AS TEXT )', col_name ) INTO old_val USING OLD;
+        old_object := TO_JSONB(OLD) - skip_columns;
+        new_object := NULL;
+    END IF;
 
-            IF old_val IS NOT NULL THEN
-                INSERT INTO t_audit_log (
-                     operation
-                    ,table_schema
-                    ,table_name
-                    ,record_id
-                    ,column_name
-                    ,old_value
-                ) VALUES (
-                     TG_OP
-                    ,TG_TABLE_SCHEMA
-                    ,TG_TABLE_NAME
-                    ,rec_id
-                    ,col_name
-                    ,old_val
-                );
-            END IF;
-        END LOOP;
+    INSERT INTO "${schema}".t_audit_log (
+         operation
+        ,table_schema
+        ,table_name
+        ,record_id
+        ,old_values
+        ,new_values
+    ) VALUES (
+         TG_OP
+        ,TG_TABLE_SCHEMA
+        ,TG_TABLE_NAME
+        ,rec_id
+        ,old_object
+        ,new_object
+    );
+
+    RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+
+
+/** Template table with columns common for all autdited tables
+    Use `CREATE TABLE (... LIKE "${schema}".__audited INCLUDING ALL)`
+**/
+CREATE TABLE "${schema}".__audited (
+     revision INT NOT NULL DEFAULT 1
+    ,created_on TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+    ,created_by INT DEFAULT NULLIF(CURRENT_SETTING('${schema}.current_identity_id', true), '')::INT /* REFERENCES t_identity */
+    ,updated_on TIMESTAMPTZ
+    ,updated_by INT /* REFERENCES t_identity */
+);
+
+
+/** Trigger function to update revision on object updates.
+**/
+CREATE OR REPLACE FUNCTION "${schema}".f_revision() RETURNS TRIGGER AS $$
+DECLARE
+    identity_id INT;
+BEGIN
+    IF NEW.revision IS NOT DISTINCT FROM OLD.revision THEN
+        NEW.revision := COALESCE(OLD.revision, 1) + 1;
+    ELSIF NEW.revision < OLD.revision THEN
+       RAISE 'Cannot update %.%: new revision % is less than old revision %', TG_TABLE_SCHEMA, TG_TABLE_NAME, NEW.revision, OLD.revision;
+    END IF;
+    NEW.updated_on := statement_timestamp();
+
+    identity_id := NULLIF(CURRENT_SETTING('${schema}.current_identity_id', true), '')::INT;
+
+    IF identity_id IS NOT NULL THEN
+        NEW.updated_by := identity_id;
+    ELSIF NEW.updated_by IS NOT NULL THEN
+        NEW.updated_by := NULL;
     END IF;
 
     RETURN NEW;
 END
-$F$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
